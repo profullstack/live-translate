@@ -1,0 +1,63 @@
+{
+  "name": "@profullstack/live-translate",
+  "version": "0.1.0",
+  "description": "Live speech translation for streams and meetings: hear (ElevenLabs Scribe), translate (pluggable), re-voice (ElevenLabs Flash), with per-listener language choices, shared pipelines, CoinPay passes and a free daily allowance. Extracted from nixamp.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./core": {
+      "types": "./dist/core.d.ts",
+      "default": "./dist/core.js"
+    },
+    "./browser": {
+      "types": "./dist/browser/index.d.ts",
+      "default": "./dist/browser/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-transform-types --no-warnings --test test/*.test.ts",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "translation",
+    "speech",
+    "live",
+    "interpreter",
+    "elevenlabs",
+    "dubbing",
+    "meetings",
+    "webrtc",
+    "subtitles",
+    "coinpay"
+  ],
+  "author": "Profullstack, Inc.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/profullstack/live-translate.git"
+  },
+  "homepage": "https://github.com/profullstack/live-translate#readme",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
