@@ -1,6 +1,6 @@
 {
   "name": "@profullstack/live-translate",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Live speech translation for streams and meetings: hear (ElevenLabs Scribe), translate (pluggable), re-voice (ElevenLabs Flash), with per-listener language choices, shared pipelines, CoinPay passes and a free daily allowance. Extracted from nixamp.",
   "type": "module",
   "main": "./dist/index.js",

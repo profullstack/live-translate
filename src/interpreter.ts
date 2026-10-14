@@ -73,6 +73,10 @@ export class Interpreter {
     hear?: (wav: Uint8Array, options: { speakers: boolean; language: string; signal: AbortSignal }) => Promise<SpeakerTranscript & { text?: string }>;
     translate?: (texts: string[], from: string, to: string, signal: AbortSignal) => Promise<{ texts: string[] }>;
     paths?: { speakers?: string; transcribe?: string; translate?: string };
+    /** When an unfinished phrase is emitted: a gap between words (`gapMs`), trailing
+     * silence before the window's end (`pauseMs`), or its age (`maxMs`). Lower is
+     * faster; higher keeps sentences whole, which translation needs. */
+    phrase?: { gapMs?: number; pauseMs?: number; maxMs?: number };
   }) {}
 
   reset(): void {
@@ -133,14 +137,15 @@ export class Interpreter {
                   language, speaker: speaker.id, voiceProfile: turn.profile });
                 phrase = [];
               };
+              const gap = (this.options.phrase?.gapMs ?? 450) / 1000, pause = this.options.phrase?.pauseMs ?? 350, longest = this.options.phrase?.maxMs ?? 3000;
               for (const word of words) {
-                if (phrase.length && word.start - phrase.at(-1)!.end >= 0.45) emit();
+                if (phrase.length && word.start - phrase.at(-1)!.end >= gap) emit();
                 phrase.push(word);
                 if (/[.!?。！？]$/.test(word.text) || phrase.map(word => word.text).join(" ").length >= 400) emit();
               }
               if (phrase.length && (index < turns.length - 1 ||
-                window.until - (window.at + phrase.at(-1)!.end * 1000) >= 350 ||
-                window.until - (window.at + phrase[0]!.start * 1000) >= 3000)) emit();
+                window.until - (window.at + phrase.at(-1)!.end * 1000) >= pause ||
+                window.until - (window.at + phrase[0]!.start * 1000) >= longest)) emit();
             }
           } else if (heard.text) {
             lines = [{ channel: this.options.channel(), at: window.freshAt, until: window.until, text: heard.text, language }];

@@ -149,6 +149,9 @@ export class RoomTranslator {
       // No target: the Interpreter only hears and phrases; targets translate.
       language: () => "", speakers: () => true, voices: () => [], channel: () => this.options.room,
       sourceLanguage: () => from,
+      // Whole sentences translate far better than 2-second fragments; a meeting
+      // can afford a second more delay than a broadcast.
+      phrase: { gapMs: 800, pauseMs: 750, maxMs: 5000 },
       status: () => undefined,
       failed: message => this.fail(hearing, message),
       lines: lines => this.heard(hearing, lines),
@@ -217,6 +220,8 @@ export class RoomTranslator {
           target.failures = 0;
         } catch (error) {
           if (signal.aborted) return;
+          // A skipped phrase is invisible to listeners; say so in the server log.
+          console.warn(JSON.stringify({ event: "room_translation_skipped", room: this.options.room, to: target.to, status: (error as { status?: number }).status ?? null, error: error instanceof Error ? error.message : String(error) }));
           if (!transientAudioError(error) || ++target.failures >= 3) throw error;
         }
       }
