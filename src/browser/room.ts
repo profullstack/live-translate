@@ -32,7 +32,8 @@ export class RoomFeeder {
     /** POST target; the participant and client ids are added as query parameters. */
     path: string; context: () => AudioContext;
     fetcher?: typeof fetch; headers?: () => HeadersInit | Promise<HeadersInit>;
-    workletUrl?: string; now?: () => number;
+    /** A served copy of the tap (see TAP_SOURCE) for a CSP without blob: scripts. */
+    workletUrl?: string; processor?: string; now?: () => number;
   }) {}
 
   has(participant: string): boolean { return this.fed.has(participant); }
@@ -43,7 +44,7 @@ export class RoomFeeder {
     const context = this.options.context();
     const source = context.createMediaStreamSource(new MediaStream([track]));
     const fed: Fed = { capture: null as unknown as AudioCapture, source, feeder: false, wanted: true, probeAt: 0, busy: false };
-    fed.capture = new AudioCapture(window => void this.chunk(participant, fed, window.samples.slice(-32_000)), { workletUrl: this.options.workletUrl });
+    fed.capture = new AudioCapture(window => void this.chunk(participant, fed, window.samples.slice(-32_000)), { workletUrl: this.options.workletUrl, processor: this.options.processor });
     this.fed.set(participant, fed);
     await fed.capture.start(context, source, 2);
   }

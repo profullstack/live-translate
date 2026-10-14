@@ -26,7 +26,7 @@ export class AudioCapture {
     if (!loaded.has(context)) loaded.set(context, context.audioWorklet.addModule(this.options.workletUrl ?? tapUrl()).catch(error => { loaded.delete(context); throw error; }));
     await loaded.get(context);
     if (generation !== this.generation) return;
-    const tap = new AudioWorkletNode(context, this.options.workletUrl ? this.options.processor ?? "nixamp-audio-tap" : TAP_PROCESSOR);
+    const tap = new AudioWorkletNode(context, this.options.workletUrl ? this.options.processor ?? TAP_PROCESSOR : TAP_PROCESSOR);
     this.tap = tap;
     const mute = context.createGain(); mute.gain.value = 0;
     source.connect(tap); tap.connect(mute); mute.connect(context.destination);
