@@ -12,6 +12,27 @@ meetings, where every participant can hear every other participant in a language
 - **Sell:** prepaid CoinPay passes (Day $1, Month $5 by default) metered at 5x provider cost, plus a free
   daily allowance (10 sessions/account/day), on any Postgres `Queryable`.
 
+## Selling passes (CoinPay hosted checkout)
+
+Since 0.3.0 a pass is bought through a CoinPay hosted checkout session: one page where the buyer picks
+any coin the business takes, or PayPal. The sale is filed under the site's hostname (`property`), the
+buyer's account id and email.
+
+```ts
+const passes = new TranslationPasses({ db, key: coinpayKeyFrom(), site: "https://example.com", app: "example" });
+// POST /checkout: email is required for a hosted session; accountId defaults to `by`.
+const { url } = await passes.checkout(user.id, "day", "", requestKey, { email: user.email, accountId: user.id });
+// Webhook: verify the raw body, then hand over the whole event.
+if (!verifyCoinpaySignature(raw, req.headers["x-coinpay-signature"], secret)) return 401;
+await passes.settle(readCoinpayWebhook(JSON.parse(raw)));
+```
+
+`settle` never trusts the body: it finds the order by `checkout_session_id` (or the older payment id) and
+asks CoinPay for the session before crediting anything, so replays credit nothing twice. A checkout
+without an email but with a `coin` still opens the older one-coin invoice, and orders opened that way
+keep settling. Options: `property` (default: `site`'s hostname), `sessions: false` to keep the one-coin
+invoice only.
+
 The ElevenLabs key never leaves the server. Browsers get short grants or an event stream.
 
 ## Entry points

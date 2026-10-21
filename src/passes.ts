@@ -26,6 +26,9 @@ export interface TranslationMeter {
 export interface TranslationAccess {
   required: boolean; available: boolean; balanceMicros: number; expires: string | null;
   plans: readonly TranslationPlan[]; coins: string[]; orders: { id: string; url: string; plan: string }[];
+  /** "session": CoinPay hosted checkout (any coin the business takes, or PayPal),
+   * needs the buyer's email; "coin": the older one-coin invoice. */
+  checkout: "session" | "coin";
   rates: { transcriptionHour: number; voiceThousand: number; multiplier: number };
   free: UpgradeAllowance;
 }
@@ -33,6 +36,11 @@ const COINS = ["USDC_POL", "USDC_SOL", "SOL", "POL", "BTC", "ETH", "USDC_ETH", "
 const ID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const DAY = 86_400_000;
 const PAID = new Set(["confirmed", "forwarding", "forwarded", "forwarding_failed", "completed"]);
+const SESSION = /^cs_[A-Za-z0-9]{16,64}$/;
+const EMAIL = /^[^\s@]{1,64}@[^\s@]{1,255}\.[^\s@]{2,63}$/;
+/** The coin column of an order opened as a hosted session: the buyer picks on CoinPay. */
+export const SESSION_COIN = "ANY";
+const COINPAY = "https://coinpayportal.com";
 
 /** At the published rates: Scribe $0.22/submitted hour, Flash $0.05/1k chars.
  * Transcription units are 16 kHz samples; overlap is charged exactly as sent. */
@@ -47,6 +55,11 @@ function cents(value: unknown): number {
   if (!/^\d+(?:\.\d{1,2}0*)?$/.test(text)) return -1;
   const result = Math.round(Number(text) * 100);
   return Number.isSafeInteger(result) ? result : -1;
+}
+/** A hosted checkout session (GET /api/checkout/sessions/:id) that paid this order's price. */
+export function verifyTranslationSession(session: Record<string, unknown>, id: string, priceCents: number): boolean {
+  return session["id"] === id && session["status"] === "paid" &&
+    String(session["currency"]).toUpperCase() === "USD" && cents(session["amount"]) === priceCents;
 }
 export function verifyTranslationPayment(payment: Record<string, unknown>, id: string, priceCents: number): boolean {
   return payment["id"] === id && PAID.has(String(payment["status"])) &&
@@ -81,15 +94,38 @@ export function verifyCoinpaySignature(raw: string, header: string | undefined, 
 /** CoinPay's webhook nests the payment under `data`, and its top-level `id` is
  * the EVENT (`evt_…`), not the payment. Read `data` first; the flat shape is
  * only the older test sender's. */
-export function readCoinpayWebhook(payload: unknown): { type: string; paymentId: string; status: string } {
+export interface CoinpayWebhookEvent {
+  type: string; paymentId: string; status: string;
+  /** The hosted checkout session the payment was made in (`cs_…`), or "". */
+  sessionId: string;
+  customerEmail: string; accountId: string; property: string;
+  metadata: Record<string, unknown>;
+}
+export function readCoinpayWebhook(payload: unknown): CoinpayWebhookEvent {
   const body = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-  const data = body["data"] && typeof body["data"] === "object" ? body["data"] as Record<string, unknown> : body;
+  const nested = Boolean(body["data"] && typeof body["data"] === "object");
+  const data = nested ? body["data"] as Record<string, unknown> : body;
+  const metadata = [data["metadata"], body["metadata"]].find(value => value && typeof value === "object" && !Array.isArray(value)) as Record<string, unknown> | undefined ?? {};
+  const field = (name: string): string => String(data[name] ?? metadata[name] ?? "");
   return {
     type: String(body["type"] ?? ""),
-    paymentId: String(data["payment_id"] ?? data["id"] ?? ""),
+    paymentId: String(data["payment_id"] ?? (nested ? data["id"] : body["id"]) ?? ""),
     status: String(data["status"] ?? "").toLowerCase(),
+    sessionId: field("checkout_session_id"),
+    customerEmail: field("customer_email"), accountId: field("account_id"), property: field("property"),
+    metadata,
   };
 }
+
+/** The site hostname CoinPay files a sale under: `https://www.nixamp.com/x` -> `nixamp.com`. */
+export function propertyOf(site: string): string {
+  try { return new URL(site).hostname.replace(/^www\./, "").toLowerCase(); } catch { return site.replace(/^https?:\/\//, "").replace(/[/:].*$/, "").replace(/^www\./, "").toLowerCase(); }
+}
+
+/** Who is buying: CoinPay hosted checkout needs an email for the receipt, and
+ * files the sale under `accountId` (the site's user id; defaults to the account
+ * the credit goes to). */
+export interface TranslationBuyer { email?: string | null; accountId?: string | null }
 
 export class TranslationPasses implements TranslationMeter {
   private schema: Promise<void> | null = null;
@@ -106,6 +142,10 @@ export class TranslationPasses implements TranslationMeter {
     label?: string;
     /** Where CoinPay sends the buyer back; defaults to `${site}/?translation_order=<id>`. */
     redirect?: (order: string) => string;
+    /** The site hostname on every CoinPay sale; defaults to `site`'s hostname. */
+    property?: string;
+    /** false: always open the older one-coin invoice instead of a hosted session. */
+    sessions?: boolean;
   }) {
     this.fetcher = options.fetcher ?? fetch; this.now = options.now ?? Date.now;
     this.free = new UpgradeAllowances(options.db, this.now);
@@ -127,15 +167,20 @@ export class TranslationPasses implements TranslationMeter {
         created_at TIMESTAMPTZ NOT NULL)`);
       await this.options.db.query(`CREATE TABLE IF NOT EXISTS translation_checkout_limits (bucket TEXT PRIMARY KEY, attempts INTEGER NOT NULL)`);
       await this.options.db.query("CREATE INDEX IF NOT EXISTS translation_orders_account ON translation_orders (by_account, created_at)");
+      // Hosted checkout sessions (0.3.0): the order holds the session; the
+      // payment id arrives with the webhook or the session's own status.
+      await this.options.db.query("ALTER TABLE translation_orders ADD COLUMN IF NOT EXISTS session_id TEXT");
+      await this.options.db.query("ALTER TABLE translation_orders ADD COLUMN IF NOT EXISTS customer_email TEXT");
+      await this.options.db.query("CREATE UNIQUE INDEX IF NOT EXISTS translation_orders_session ON translation_orders (session_id)");
     })().catch(error => { this.schema = null; throw error; });
     await this.schema;
   }
   private async provider(path: string, init: RequestInit = {}): Promise<any> {
     if (!this.options.key) throw new SpeechError("Translation checkout is unavailable.", 503);
-    const response = await this.fetcher(`https://coinpayportal.com${path}`, {
+    const response = await this.fetcher(`${COINPAY}${path}`, {
       ...init, signal: AbortSignal.timeout(15_000), headers: { authorization: `Bearer ${this.options.key}`, "content-type": "application/json", ...init.headers },
     });
-    const body = await response.json();
+    const body = await response.json().catch(() => ({}));
     if (!response.ok || body.success !== true) throw new SpeechError("The payment service is unavailable. Your purchase has not been activated; retry to check its status.", 502);
     return body;
   }
@@ -154,8 +199,9 @@ export class TranslationPasses implements TranslationMeter {
     await this.ensure();
     const config = await this.settings().catch(() => ({ business: "", coins: [] as string[] }));
     const row = by ? (await this.options.db.query("SELECT balance_micros, expires_at FROM translation_wallets WHERE by_account = $1 AND expires_at > $2", [by, new Date(this.now())])).rows[0] : null;
-    const orders = by ? (await this.options.db.query("SELECT id, payment_id, plan FROM translation_orders WHERE by_account = $1 AND status = 'pending' AND payment_id IS NOT NULL ORDER BY created_at DESC LIMIT 5", [by])).rows.map(order => ({ id: String(order["id"]), plan: String(order["plan"]), url: `https://coinpayportal.com/pay/${order["payment_id"]}` })) : [];
-    return { required: true, available: config.coins.length > 0, balanceMicros: Number(row?.["balance_micros"] ?? 0),
+    const orders = by ? (await this.options.db.query("SELECT id, payment_id, session_id, plan FROM translation_orders WHERE by_account = $1 AND status = 'pending' AND (payment_id IS NOT NULL OR session_id IS NOT NULL) ORDER BY created_at DESC LIMIT 5", [by])).rows.map(order => ({ id: String(order["id"]), plan: String(order["plan"]), url: orderUrl(order) })) : [];
+    const sessions = this.options.sessions !== false;
+    return { required: true, available: sessions ? Boolean(config.business) : config.coins.length > 0, checkout: sessions ? "session" : "coin", balanceMicros: Number(row?.["balance_micros"] ?? 0),
       expires: row ? new Date(String(row["expires_at"])).toISOString() : null, plans: TRANSLATION_PLANS, coins: config.coins, orders, free: await this.free.access(by),
       rates: { transcriptionHour: 0.22, voiceThousand: 0.05, multiplier: TRANSLATION_MULTIPLIER } };
   }
@@ -217,12 +263,27 @@ export class TranslationPasses implements TranslationMeter {
       UPDATE translation_wallets AS wallet SET balance_micros = wallet.balance_micros + totals.charge
       FROM totals WHERE wallet.by_account = totals.by_account`, [ids]);
   }
-  async checkout(by: string, planId: string, coin: string, requestKey: string): Promise<{ id: string; url: string }> {
+  /**
+   * Open (or resume) a purchase. With the buyer's email this is a CoinPay hosted
+   * checkout session: one page where the buyer picks any coin the business takes
+   * or PayPal, filed under `property` with `account_id` + `customer_email`.
+   * Without an email (an older client), or with `sessions: false`, it is the
+   * one-coin invoice `coin` names. Retrying the same `requestKey` resumes the
+   * same order and never opens a second session or invoice.
+   */
+  async checkout(by: string, planId: string, coin: string, requestKey: string, buyer: TranslationBuyer = {}): Promise<{ id: string; url: string }> {
     await this.ensure();
     const plan = TRANSLATION_PLANS.find(plan => plan.id === planId);
     if (!plan || !ID.test(requestKey)) throw new SpeechError("Choose a translation pass.", 400);
+    const email = typeof buyer.email === "string" ? buyer.email.trim().toLowerCase() : "";
+    if (email && !EMAIL.test(email)) throw new SpeechError("Enter a valid email for the receipt.", 400);
+    const hosted = this.options.sessions !== false && Boolean(email);
     const config = await this.settings();
-    if (!config.coins.includes(coin)) throw new SpeechError("Choose an available payment currency.", 400);
+    if (!hosted) {
+      if (this.options.sessions !== false && !config.coins.includes(coin)) throw new SpeechError("Enter an email for the receipt.", 400);
+      if (!config.coins.includes(coin)) throw new SpeechError("Choose an available payment currency.", 400);
+    }
+    const method = hosted ? SESSION_COIN : coin;
     // Durable caps across restarts/replicas protect the merchant's invoice quota.
     // Retrying an existing order does not consume another invoice allowance.
     const existing = await this.options.db.query("SELECT id FROM translation_orders WHERE by_account = $1 AND request_key = $2", [by, requestKey]);
@@ -235,25 +296,46 @@ export class TranslationPasses implements TranslationMeter {
       }
     }
     const id = randomUUID();
-    await this.options.db.query(`INSERT INTO translation_orders (id, by_account, request_key, plan, price_cents, days, business_id, coin, created_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (by_account, request_key) DO NOTHING`,
-    [id, by, requestKey, plan.id, plan.priceCents, plan.days, config.business, coin, new Date(this.now())]);
-    const order = (await this.options.db.query("SELECT * FROM translation_orders WHERE by_account = $1 AND request_key = $2", [by, requestKey])).rows[0]!;
-    if (order["plan"] !== plan.id || order["coin"] !== coin) throw new SpeechError("This checkout already belongs to a different pass. Start a new purchase.", 409);
-    let paymentId = String(order["payment_id"] ?? "");
-    if (!paymentId) {
+    await this.options.db.query(`INSERT INTO translation_orders (id, by_account, request_key, plan, price_cents, days, business_id, coin, created_at, customer_email)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (by_account, request_key) DO NOTHING`,
+    [id, by, requestKey, plan.id, plan.priceCents, plan.days, config.business, method, new Date(this.now()), email || null]);
+    let order = (await this.options.db.query("SELECT * FROM translation_orders WHERE by_account = $1 AND request_key = $2", [by, requestKey])).rows[0]!;
+    if (order["plan"] !== plan.id || order["coin"] !== method) throw new SpeechError("This checkout already belongs to a different pass. Start a new purchase.", 409);
+    if (order["session_id"] || order["payment_id"]) return { id: String(order["id"]), url: orderUrl(order) };
+    const redirect = this.options.redirect?.(String(order["id"])) ?? `${this.options.site}/?translation_order=${order["id"]}`;
+    const description = `${this.options.label ?? "Translated audio"}: ${plan.name} pass`;
+    const metadata = { app: this.options.app ?? "live-translate", product: "translation", order_id: order["id"] };
+    if (hosted) {
+      const created = await this.provider("/api/checkout/sessions", {
+        method: "POST",
+        body: JSON.stringify(this.sessionBody(order, { email, accountId: buyer.accountId || by }, { description, metadata, redirect })),
+      });
+      const sessionId = String(created.id ?? "");
+      if (!SESSION.test(sessionId)) throw new SpeechError("Checkout did not return a valid session. Retry this purchase.", 502);
+      await this.options.db.query("UPDATE translation_orders SET session_id = $2 WHERE id = $1 AND session_id IS NULL", [order["id"], sessionId]);
+    } else {
       const created = await this.provider("/api/payments/create", {
         method: "POST", headers: { "idempotency-key": `${this.options.app ?? "live-translate"}-translation-${order["id"]}` },
         body: JSON.stringify({ business_id: order["business_id"], amount_usd: Number(order["price_cents"]) / 100,
-          currency: coin.toLowerCase(), payment_method: "crypto", description: `${this.options.label ?? "Translated audio"}: ${plan.name} pass`,
-          metadata: { app: this.options.app ?? "live-translate", product: "translation", order_id: order["id"] },
-          redirect_url: this.options.redirect?.(String(order["id"])) ?? `${this.options.site}/?translation_order=${order["id"]}` }),
+          currency: coin.toLowerCase(), payment_method: "crypto", description, metadata, redirect_url: redirect }),
       });
-      paymentId = created.payment?.id;
+      const paymentId = created.payment?.id;
       if (!ID.test(paymentId ?? "")) throw new SpeechError("Checkout did not return a valid payment. Retry this purchase.", 502);
       await this.options.db.query("UPDATE translation_orders SET payment_id = $2 WHERE id = $1 AND payment_id IS NULL", [order["id"], paymentId]);
     }
-    return { id: String(order["id"]), url: `https://coinpayportal.com/pay/${paymentId}` };
+    // A second tab that raced this one keeps whichever session landed first.
+    order = (await this.options.db.query("SELECT * FROM translation_orders WHERE id = $1", [order["id"]])).rows[0]!;
+    return { id: String(order["id"]), url: orderUrl(order) };
+  }
+  /** The POST /api/checkout/sessions body CoinPay gets for an order. */
+  sessionBody(order: Record<string, unknown>, buyer: { email: string; accountId: string },
+    shown: { description: string; metadata: Record<string, unknown>; redirect: string }): Record<string, unknown> {
+    return {
+      amount: Number(order["price_cents"]) / 100, currency: "USD", description: shown.description,
+      customer_email: buyer.email, account_id: buyer.accountId,
+      property: this.options.property || propertyOf(this.options.site),
+      metadata: shown.metadata, success_url: shown.redirect, cancel_url: shown.redirect, expires_in_minutes: 60,
+    };
   }
   /**
    * A CoinPay webhook only says "look again". The order is settled by asking
@@ -262,10 +344,19 @@ export class TranslationPasses implements TranslationMeter {
    * forwarded) credits nothing twice. A payment that is not ours is answered,
    * not failed: CoinPay would otherwise retry it forever.
    */
-  async settle(paymentId: string): Promise<{ settled: boolean; status?: string; reason?: string }> {
-    if (!ID.test(paymentId)) return { settled: false, reason: "unknown payment" };
+  async settle(event: string | Partial<Pick<CoinpayWebhookEvent, "paymentId" | "sessionId" | "metadata">>): Promise<{ settled: boolean; status?: string; reason?: string }> {
+    const ref = typeof event === "string" ? { paymentId: event } : event ?? {};
+    const paymentId = String(ref.paymentId ?? ""), sessionId = String(ref.sessionId ?? "") || (SESSION.test(paymentId) ? paymentId : "");
+    const orderId = String((ref.metadata as Record<string, unknown> | undefined)?.["order_id"] ?? "");
+    if (!SESSION.test(sessionId) && !ID.test(paymentId) && !ID.test(orderId)) return { settled: false, reason: "unknown payment" };
     await this.ensure();
-    const order = (await this.options.db.query("SELECT id, by_account FROM translation_orders WHERE payment_id = $1", [paymentId])).rows[0];
+    // The session first: a session payment's id is only known to CoinPay until
+    // it settles. Then the payment (older one-coin orders still in flight).
+    // The order id in metadata alone is trusted only to point at a session order.
+    let order: Record<string, unknown> | undefined;
+    if (SESSION.test(sessionId)) order = (await this.options.db.query("SELECT id, by_account FROM translation_orders WHERE session_id = $1", [sessionId])).rows[0];
+    if (!order && paymentId) order = (await this.options.db.query("SELECT id, by_account FROM translation_orders WHERE payment_id = $1", [paymentId])).rows[0];
+    if (!order && ID.test(orderId)) order = (await this.options.db.query("SELECT id, by_account FROM translation_orders WHERE id = $1 AND session_id IS NOT NULL", [orderId])).rows[0];
     if (!order) return { settled: false, reason: "unknown payment" };
     const { status } = await this.check(String(order["by_account"]), String(order["id"]));
     return { settled: status === "paid", status };
@@ -276,10 +367,21 @@ export class TranslationPasses implements TranslationMeter {
     const order = (await this.options.db.query("SELECT * FROM translation_orders WHERE id = $1 AND by_account = $2", [id, by])).rows[0];
     if (!order) throw new SpeechError("Purchase not found.", 404);
     let status = String(order["status"]);
-    if (["pending", "expired"].includes(status) && order["payment_id"]) {
-      const result = await this.provider(`/api/payments/${encodeURIComponent(String(order["payment_id"]))}`);
-      const payment = result.payment;
-      if (payment && verifyTranslationPayment(payment, String(order["payment_id"]), Number(order["price_cents"]))) {
+    if (["pending", "expired"].includes(status) && (order["session_id"] || order["payment_id"])) {
+      // A session order asks the session (paid by any coin or PayPal); an older
+      // one-coin order asks its payment, so in-flight invoices still settle.
+      let paid = false, gone = "", paymentRef: string | null = null;
+      if (order["session_id"]) {
+        const session = (await this.provider(`/api/checkout/sessions/${encodeURIComponent(String(order["session_id"]))}`)).session;
+        paid = Boolean(session) && verifyTranslationSession(session, String(order["session_id"]), Number(order["price_cents"]));
+        if (paid) paymentRef = String(session["payment_id"] ?? session["paypal_transaction_id"] ?? session["paid_reference"] ?? "") || null;
+        else if (session?.status === "expired") gone = "expired";
+      } else {
+        const payment = (await this.provider(`/api/payments/${encodeURIComponent(String(order["payment_id"]))}`)).payment;
+        paid = Boolean(payment) && verifyTranslationPayment(payment, String(order["payment_id"]), Number(order["price_cents"]));
+        if (!paid && payment && ["expired", "failed", "refunded"].includes(payment.status)) gone = payment.status;
+      }
+      if (paid) {
         const now = new Date(this.now()), expires = new Date(this.now() + Number(order["days"]) * DAY);
         // One statement atomically marks the order and adds credit. A retry,
         // second tab or second replica cannot activate the same money twice.
@@ -291,12 +393,18 @@ export class TranslationPasses implements TranslationMeter {
           ON CONFLICT (by_account) DO UPDATE SET
             balance_micros = CASE WHEN translation_wallets.expires_at > $3 THEN translation_wallets.balance_micros ELSE 0 END + EXCLUDED.balance_micros,
             expires_at = GREATEST(translation_wallets.expires_at, EXCLUDED.expires_at)`, [id, by, now, expires]);
+        if (paymentRef) await this.options.db.query("UPDATE translation_orders SET payment_id = $2 WHERE id = $1 AND payment_id IS NULL AND NOT EXISTS (SELECT 1 FROM translation_orders WHERE payment_id = $2)", [id, paymentRef]);
         status = "paid";
-      } else if (payment && ["expired", "failed", "refunded"].includes(payment.status)) {
-        status = payment.status;
+      } else if (gone) {
+        status = gone;
         await this.options.db.query("UPDATE translation_orders SET status = $3 WHERE id = $1 AND by_account = $2 AND status = 'pending'", [id, by, status]);
       }
     }
     return { status, access: await this.access(by) };
   }
+}
+
+/** Where a buyer finishes an order: its hosted session, or its one-coin invoice. */
+function orderUrl(order: Record<string, unknown>): string {
+  return order["session_id"] ? `${COINPAY}/checkout/${order["session_id"]}` : `${COINPAY}/pay/${order["payment_id"]}`;
 }
